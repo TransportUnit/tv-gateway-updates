@@ -1,0 +1,173 @@
+#!/bin/sh
+# Run by cron every minute: probe the internet, track the state, capture and log in to a captive
+# portal, switch to another allowed network when needed, send the heartbeat and queued messages,
+# answer Telegram commands. State lives in $STATE_DIR (RAM).
+
+. /usr/lib/gateway/lib.sh
+. /usr/lib/gateway/net.sh
+. /usr/lib/gateway/bot.sh
+
+# One run at a time; a lock older than 10 minutes is stale.
+LOCK="$STATE_DIR/lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+	[ "$(age lock_time)" -lt 600 ] && exit 0
+	log "removing stale lock"
+fi
+state_set lock_time "$(now)"
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# set_status NEW [quiet]: a portal episode is quiet; it is reported when it ends or when login fails.
+set_status() {
+	prev=$(state_get status unknown)
+	[ "$prev" = "$1" ] && return
+	since=$(state_get status_since "$(now)")
+	state_set status "$1"
+	state_set status_since "$(now)"
+	log "status $prev -> $1"
+	[ -n "$2" ] && return
+	if [ "$1" = online ]; then
+		if [ "$prev" = unknown ]; then
+			notify "online"
+		else
+			notify "online again (was $prev for $(fmt_dur $(( $(now) - since ))))"
+		fi
+	else
+		notify "$1 (was $prev)"
+	fi
+}
+
+# Store everything needed to analyse the portal at home: redirect chain, headers (cookie values
+# redacted), page, linked scripts, form analysis, network facts. Keeps the last 3 on flash.
+capture() {
+	d="$STATE_DIR/capture"
+	rm -rf "$d"
+	mkdir -p "$d" "$CAPTURE_DIR"
+	cp "$STATE_DIR/probe.head" "$d/00-probe-headers.txt"
+	head -c 65536 "$STATE_DIR/probe.body" > "$d/00-probe-body.html"
+	# HTTP redirect chain with all headers, then the page the login will see (after meta refreshes).
+	portal_curl -L --max-redirs 10 --max-filesize 1048576 -D "$d/01-headers.txt" -o "$d/01-first-page.html" \
+		-w 'final url: %{url_effective}\nhttp code: %{http_code}\nredirects: %{num_redirects}\n' \
+		"$CHECK_URL" > "$d/01-result.txt"
+	portal_fetch
+	url=$PAGE_URL
+	cp "$PAGE" "$d/02-page.html"
+	cp "$PAGE_HEADERS" "$d/02-page-headers.txt"
+	echo "$url" > "$d/02-page-url.txt"
+	lua "$LIB_DIR/portal-generic.lua" describe "$d/02-page.html" "$url" > "$d/03-forms.txt" 2>&1
+	n=0
+	for s in $(lua "$LIB_DIR/portal-generic.lua" scripts "$d/02-page.html" "$url" 2>/dev/null); do
+		n=$(( n + 1 ))
+		[ $n -gt 8 ] && break
+		echo "$s" > "$d/04-script-$n.url"
+		portal_curl -e "$url" --max-filesize 524288 -o "$d/04-script-$n.js" "$s"
+	done
+	{
+		date
+		ip -4 addr 2>/dev/null
+		ip route 2>/dev/null
+		cat /tmp/resolv.conf.auto 2>/dev/null
+		iwinfo 2>/dev/null
+	} > "$d/05-network.txt"
+	sed -i 's/^\([Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]: *[^=]*=\)[^;]*/\1<redacted>/' "$d"/*headers.txt
+	f="$CAPTURE_DIR/capture-$(date +%Y%m%d-%H%M%S).tar.gz"
+	tar -czf "$f" -C "$d" .
+	ls -t "$CAPTURE_DIR"/capture-*.tar.gz 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null
+	notify_file "$f"
+	log "portal captured: $url"
+}
+
+# Try the site recipe; back off 1, 2, 4 ... 30 minutes between failed attempts.
+login() {
+	[ "$(now)" -lt "$(state_get login_next 0)" ] && return
+	attempt=$(( $(state_get login_attempts 0) + 1 ))
+	state_set login_attempts $attempt
+	portal_fetch
+	/etc/gateway/portal-login.sh "$PAGE" "$PAGE_URL" > "$STATE_DIR/login.out" 2>&1
+	rc=$?
+	info=$(tail -n 1 "$STATE_DIR/login.out")
+	sleep 3
+	probe
+	if [ "$PROBE" = online ]; then
+		log "login ok after $attempt attempt(s): $info"
+		state_set login_attempts 0
+		state_set login_next 0
+		# Fetch a newer recipe right after a login, the moment the router is reachable again.
+		state_set update_last 0
+		set_status online
+		return
+	fi
+	delay=$(( 60 << (attempt - 1) ))
+	[ $delay -gt 1800 ] && delay=1800
+	state_set login_next $(( $(now) + delay ))
+	log "login attempt $attempt failed (rc $rc, now $PROBE): $info"
+	if [ $attempt -eq 1 ]; then
+		notify "portal login FAILED (rc $rc): $info. Retrying with backoff."
+		[ "$(state_get episode_captured 0)" = 1 ] || capture
+	fi
+	# On the primary network keep trying (a recipe update may fix it); elsewhere move on.
+	[ $attempt -ge 3 ] && [ "$(net_current)" != "$UPSTREAM_SSID" ] && net_next force
+}
+
+probe
+[ "$PROBE" = online ] || { sleep 5; probe; }
+
+case "$PROBE" in
+online)
+	state_set fails 0
+	set_status online
+	;;
+portal)
+	state_set fails 0
+	if [ "$(state_get status unknown)" != portal ]; then
+		rm -f "$STATE_DIR/cookies"
+		state_set login_attempts 0
+		state_set login_next 0
+		set_status portal quiet
+		# Capture the first portal after boot; later ones only when the login fails.
+		state_set episode_captured 0
+		if [ ! -f "$STATE_DIR/captured_once" ]; then
+			capture
+			touch "$STATE_DIR/captured_once"
+			state_set episode_captured 1
+		fi
+	fi
+	login
+	;;
+offline)
+	fails=$(( $(state_get fails 0) + 1 ))
+	state_set fails $fails
+	if [ "$(state_get status unknown)" = online ] && [ $fails -lt "$FAIL_THRESHOLD" ]; then
+		log "probe offline ($fails/$FAIL_THRESHOLD), still counted as online"
+	else
+		set_status offline
+		net_next
+	fi
+	;;
+esac
+
+if [ "$PROBE" = online ]; then
+	rm -f "$STATE_DIR/net_tried"
+	if [ "$(state_get net_announce 0)" = 1 ]; then
+		state_set net_announce 0
+		[ "$(net_current)" = "$UPSTREAM_SSID" ] || notify "online via $(net_current) (primary $UPSTREAM_SSID not usable)"
+	fi
+	# This run is online with the installed scripts: confirm a pending update (gateway-guard would
+	# otherwise roll it back). Runs before the update step, so a fresh install is confirmed next run.
+	if [ -f /etc/gateway/update_pending ]; then
+		v=$(sed -n 's/^version=//p' /etc/gateway/update_pending)
+		rm -f /etc/gateway/update_pending
+		log "update $v confirmed"
+		notify "update $v confirmed (online with it)"
+	fi
+	queue_flush || log "telegram send failed, kept in queue"
+	if [ "$(age hb_last)" -ge "$HEARTBEAT_EVERY" ]; then
+		heartbeat "" "$(state_get status) since $(date -d @"$(state_get status_since 0)" 2>/dev/null)" \
+			&& state_set hb_last "$(now)" || log "heartbeat failed"
+	fi
+	if [ -n "$UPDATE_URL" ] && [ "$(age update_last)" -ge "$UPDATE_EVERY" ]; then
+		state_set update_last "$(now)"
+		/usr/bin/gateway-update
+		queue_flush || true
+	fi
+	bot_poll || log "telegram poll failed"
+fi

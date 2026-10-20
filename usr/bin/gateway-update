@@ -1,0 +1,102 @@
+#!/bin/sh
+# Pull a signed update from $UPDATE_URL: manifest + manifest.sig (usign) and the listed files.
+# Manifest lines: "version N", "probation SECONDS", "rollback yes|no" and "<sha256> <mode> <path>".
+# Files are only installed into the gateway's own paths, and only after all signatures and checksums
+# are fine. The replaced files are kept in $RB; gateway-check confirms the update once it is online
+# with it, otherwise gateway-guard restores them after the probation time (unless "rollback no").
+
+. /usr/lib/gateway/lib.sh
+
+[ -n "$UPDATE_URL" ] || exit 0
+PUB=/etc/gateway/update.pub
+PENDING=/etc/gateway/update_pending
+RB=/etc/gateway/rollback
+REJECTED=/etc/gateway/rejected_versions
+d="$STATE_DIR/update"
+
+fail() {
+	log "update: $*"
+	notify "update rejected: $*"
+	rm -rf "$d"
+	exit 1
+}
+
+# An unconfirmed update with rollback is the guard's business; never stack a second one on top.
+if [ -f "$PENDING" ]; then
+	p_installed=$(sed -n 's/^installed=//p' "$PENDING")
+	p_probation=$(sed -n 's/^probation=//p' "$PENDING")
+	p_rollback=$(sed -n 's/^rollback=//p' "$PENDING")
+	if [ $(( $(now) - p_installed )) -lt "$p_probation" ] || [ "$p_rollback" = yes ]; then
+		log "update: version $(sed -n 's/^version=//p' "$PENDING") not confirmed yet, waiting"
+		exit 0
+	fi
+fi
+
+rm -rf "$d"
+mkdir -p "$d"
+if ! curl -sf -m 30 -o "$d/manifest" "$UPDATE_URL/manifest" ||
+	! curl -sf -m 30 -o "$d/manifest.sig" "$UPDATE_URL/manifest.sig"; then
+	log "update: manifest not reachable"
+	rm -rf "$d"
+	exit 1
+fi
+command -v usign >/dev/null || fail "usign missing on the router"
+usign -V -q -m "$d/manifest" -x "$d/manifest.sig" -p "$PUB" || fail "bad signature"
+
+version=$(sed -n 's/^version \([0-9][0-9]*\)$/\1/p' "$d/manifest")
+[ -n "$version" ] || fail "manifest without version"
+probation=$(sed -n 's/^probation \([0-9][0-9]*\)$/\1/p' "$d/manifest")
+probation=${probation:-900}
+rollback=$(sed -nE 's/^rollback (yes|no)$/\1/p' "$d/manifest")
+rollback=${rollback:-yes}
+current=$(cat /etc/gateway/version 2>/dev/null || echo 0)
+if [ "$version" -le "$current" ]; then
+	log "update: version $version, installed $current, nothing to do"
+	rm -rf "$d"
+	exit 0
+fi
+if grep -qx "$version" "$REJECTED" 2>/dev/null; then
+	log "update: version $version was rolled back before, skipped"
+	rm -rf "$d"
+	exit 0
+fi
+
+grep -E '^[0-9a-f]{64} [0-7]{3} /' "$d/manifest" > "$d/files" || fail "manifest without files"
+n=0
+while read -r sum mode path; do
+	case "$path" in
+	*..*) fail "path not allowed: $path" ;;
+	/usr/bin/gateway-check | /usr/bin/gateway-update | /usr/lib/gateway/* | /etc/gateway/portal-login.sh) ;;
+	*) fail "path not allowed: $path" ;;
+	esac
+	n=$(( n + 1 ))
+	curl -sf -m 60 -o "$d/f$n" "$UPDATE_URL$path" || fail "cannot fetch $path"
+	[ "$(sha256sum "$d/f$n" | cut -d' ' -f1)" = "$sum" ] || fail "checksum mismatch: $path"
+done < "$d/files"
+
+# Keep what is replaced, so gateway-guard can restore it.
+rm -rf "$RB"
+mkdir -p "$RB/files"
+echo "$current" > "$RB/version"
+: > "$RB/new"
+while read -r sum mode path; do
+	if [ -f "$path" ]; then
+		mkdir -p "$RB/files$(dirname "$path")"
+		cp -p "$path" "$RB/files$path"
+	else
+		echo "$path" >> "$RB/new"
+	fi
+done < "$d/files"
+
+n=0
+while read -r sum mode path; do
+	n=$(( n + 1 ))
+	mkdir -p "$(dirname "$path")"
+	cp "$d/f$n" "$path.new" && chmod "$mode" "$path.new" && mv "$path.new" "$path" || fail "cannot install $path"
+done < "$d/files"
+
+echo "$version" > /etc/gateway/version
+printf 'version=%s\ninstalled=%s\nprobation=%s\nrollback=%s\n' "$version" "$(now)" "$probation" "$rollback" > "$PENDING"
+log "update: installed version $version ($n files, probation ${probation}s, rollback $rollback)"
+notify "updated to version $version ($n files); rollback $rollback, must be online with it within $(( probation / 60 )) min"
+rm -rf "$d"

@@ -1,0 +1,10 @@
+version 1
+probation 900
+rollback yes
+196ddf1ed220e44b6582b8a07fece5ce0cdfaa7bec2b46bdc43e6d2d8404c1b5 755 /usr/bin/gateway-check
+6cd05d4d8d9a6b3ba5ff4c68fb28bd7a6927b6f803974a404741e55563f170aa 755 /usr/bin/gateway-update
+21610be9564b3ab0a1a46334c95c6eae9e8adff13e12c12df4abd8028a870ce9 755 /usr/lib/gateway/lib.sh
+f367fa91ee03d0fb4f009e981a03fc2e2d698755e086aba1f52f818deac1655f 755 /usr/lib/gateway/net.sh
+ce0b9c52439eacff38e08e96a0afd438af11a1b0f1c232aabf972e009fc0cd98 755 /usr/lib/gateway/bot.sh
+874fa60a19b0231f9d30a8f39f361fa29663ae39e4fb35093aa5dec44751f032 644 /usr/lib/gateway/portal-generic.lua
+c5eee46a7679b5c84d65f1d1f6d938bee3fa066c0f51df6eadfb3eebd4deed8e 755 /etc/gateway/portal-login.sh
