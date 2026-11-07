@@ -1,11 +1,11 @@
-version 2
+version 3
 probation 900
 rollback yes
 6aec28837508ffbba576fa99353df8c93aa56bf853b67cadee5f80fb410727e5 755 /usr/bin/gateway-check
 6cd05d4d8d9a6b3ba5ff4c68fb28bd7a6927b6f803974a404741e55563f170aa 755 /usr/bin/gateway-update
 d8a93b491c4b71e59957c69c67299fc841453a2424ed9a35bac2115a9e137b16 755 /usr/lib/gateway/lib.sh
 d9f88ad91448798788e01976c7a3c0a22f72b99f1acc50d7c418f5af1c092744 755 /usr/lib/gateway/net.sh
-5393641ee8f540018041a65b797a4d31089c6aedad65ebc2ce71bbaed9a09983 755 /usr/lib/gateway/bot.sh
+74f1d5bfd7ac7fe42a2c0eefb8e057fd604940f3c082e61104f693ea2f77b09a 755 /usr/lib/gateway/bot.sh
 cfbb296fc28dff3031cf823f0865b041112b98f6d36d0886fe63683b96fdc6cd 755 /usr/lib/gateway/diag.sh
 284c36f63880e82cbbcf2001bf4652204c94fce07df9f609237d2e70ae5c93f9 755 /usr/lib/gateway/recovery.sh
 fa1fa616fcb689bda13fdb3a1b5e2701401481e7c8b8876cc0724dc8c1dfbd85 755 /usr/lib/gateway/www.sh

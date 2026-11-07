@@ -19,12 +19,12 @@ is_admin() { [ "$1" = "$TG_CHAT" ]; }
 is_user() { is_admin "$1" || grep -q "^$1 " "$USERS_FILE" 2>/dev/null; }
 
 bot_name() {
-	n=$(state_get bot_name "")
-	if [ -z "$n" ]; then
-		n=$(tg_api getMe | jsonfilter -e '@.result.username')
-		[ -n "$n" ] && state_set bot_name "$n"
+	bn=$(state_get bot_name "")
+	if [ -z "$bn" ]; then
+		bn=$(tg_api getMe | jsonfilter -e '@.result.username')
+		[ -n "$bn" ] && state_set bot_name "$bn"
 	fi
-	echo "$n"
+	echo "$bn"
 }
 
 invite_new() {
@@ -58,13 +58,141 @@ status_text() {
 	echo "uptime: $(uptime | sed 's/^ *//')"
 }
 
-HELP="/status, /log, /capture (last portal capture), /diag (diagnosis bundle), /update, /network, /mac, /primary (leave the rescue hotspot)
+# Console over Telegram (owner and invited users, user decision 07.11.2026): "/shell", then "/shell yes"
+# within 2 minutes. While open, every message of that chat that is not a bot command runs as root on the
+# router (sh, non-interactive; the directory is kept between commands); the reply is the output and the
+# exit code, a long output also as a file. One console at a time. Closed by /exit, after SHELL_IDLE s
+# without a command or SHELL_MAX s after opening (RAM state: a reboot closes it too). A command is killed
+# after SHELL_CMD_TIMEOUT s. Opening and closing are events on flash; commands go to the RAM log.
+SHELL_DIR="$STATE_DIR/shell"
+SHELL_IDLE=${SHELL_IDLE:-600}
+SHELL_MAX=${SHELL_MAX:-3600}
+SHELL_CMD_TIMEOUT=${SHELL_CMD_TIMEOUT:-60}
+SHELL_TEXT_MAX=${SHELL_TEXT_MAX:-3500}
+
+shell_get() { cat "$SHELL_DIR/$1" 2>/dev/null; }
+
+# shell_close REASON: close the console and tell its chat (and the owner, if someone else opened it).
+shell_close() {
+	schat=$(shell_get chat)
+	[ -n "$schat" ] || return 0
+	sname=$(shell_get name)
+	rm -rf "$SHELL_DIR"
+	tg_reply "$schat" "console closed: $1"
+	is_admin "$schat" || tg_reply "$TG_CHAT" "console of $sname ($schat) closed: $1"
+	event "shell closed for $sname ($schat): $1"
+}
+
+# Close a console that was idle too long or open too long. Returns 0 while one is open.
+shell_check() {
+	[ -f "$SHELL_DIR/chat" ] || return 1
+	tnow=$(now)
+	if [ $(( tnow - $(shell_get last) )) -ge "$SHELL_IDLE" ]; then
+		shell_close "no command for $(( SHELL_IDLE / 60 )) min"
+		return 1
+	fi
+	if [ $(( tnow - $(shell_get start) )) -ge "$SHELL_MAX" ]; then
+		shell_close "open for $(( SHELL_MAX / 60 )) min (maximum)"
+		return 1
+	fi
+	return 0
+}
+
+shell_open_for() { shell_check && [ "$(shell_get chat)" = "$1" ]; }
+
+# A process that still runs (a finished child stays a zombie until waited for).
+alive() {
+	st=$(cut -d' ' -f3 "/proc/$1/stat" 2>/dev/null)
+	[ -n "$st" ] && [ "$st" != Z ]
+}
+
+# kill_tree PID: kill a process and all its descendants (BusyBox has no pkill, maybe no timeout).
+kill_tree() {
+	for k in $(grep -l "^PPid:[[:space:]]*$1\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3); do
+		kill_tree "$k"
+	done
+	kill -9 "$1" 2>/dev/null
+}
+
+# shell_run CHAT TEXT: run TEXT in the console's directory, reply with output and exit code.
+shell_run() {
+	echo "$(now)" > "$SHELL_DIR/last"
+	log "shell: $(shell_get name) ($1): $(printf '%s' "$2" | tr '\n' ' ' | cut -c1-200)"
+	cwd=$(shell_get cwd)
+	{
+		printf "cd '%s' 2>/dev/null || cd /root\n" "$(printf '%s' "${cwd:-/root}" | sed "s/'/'\\\\''/g")"
+		printf '%s\n' "$2"
+		printf 'rc=$?\npwd > "%s/cwd"\nexit $rc\n' "$SHELL_DIR"
+	} > "$SHELL_DIR/cmd.sh"
+	sh "$SHELL_DIR/cmd.sh" > "$SHELL_DIR/out" 2>&1 < /dev/null &
+	pid=$!
+	waited=0
+	while alive $pid && [ $waited -lt "$SHELL_CMD_TIMEOUT" ]; do
+		sleep 1
+		waited=$(( waited + 1 ))
+	done
+	if alive $pid; then
+		kill_tree $pid
+		wait $pid 2>/dev/null
+		rc="killed after ${SHELL_CMD_TIMEOUT} s"
+	else
+		wait $pid
+		rc="rc $?"
+	fi
+	echo "$(now)" > "$SHELL_DIR/last"
+	size=$(wc -c < "$SHELL_DIR/out")
+	if [ "$size" -eq 0 ]; then
+		tg_reply "$1" "[$rc, no output]"
+	elif [ "$size" -le "$SHELL_TEXT_MAX" ]; then
+		tg_reply "$1" "$(cat "$SHELL_DIR/out")
+[$rc]"
+	else
+		tg_reply "$1" "$(head -c "$SHELL_TEXT_MAX" "$SHELL_DIR/out")
+... [$rc, $size bytes, full output as file]"
+		cp "$SHELL_DIR/out" "$SHELL_DIR/output.txt"
+		tg_api sendDocument -F "chat_id=$1" -F "document=@$SHELL_DIR/output.txt" -o /dev/null
+	fi
+}
+
+# /shell [yes]
+shell_cmd() {
+	if shell_check; then
+		if [ "$(shell_get chat)" = "$1" ]; then
+			tg_reply "$1" "console already open; /exit closes it"
+		else
+			tg_reply "$1" "console is open for $(shell_get name); only one at a time"
+		fi
+		return
+	fi
+	if [ "$2" != yes ]; then
+		state_set shell_asked "$(now) $1"
+		tg_reply "$1" "Console: send '/shell yes' within 2 minutes. Then every message that is not a bot command runs as root on the router (no interactive programs; each stopped after $SHELL_CMD_TIMEOUT s). /exit closes it; it closes itself after $(( SHELL_IDLE / 60 )) min without a command, at most after $(( SHELL_MAX / 60 )) min."
+		return
+	fi
+	asked=$(state_get shell_asked 0)
+	if [ "${asked#* }" != "$1" ] || [ $(( $(now) - ${asked%% *} )) -gt 120 ]; then
+		tg_reply "$1" "send '/shell' first"
+		return
+	fi
+	state_set shell_asked 0
+	mkdir -p "$SHELL_DIR"
+	echo "$name" > "$SHELL_DIR/name"
+	echo "$(now)" > "$SHELL_DIR/start"
+	echo "$(now)" > "$SHELL_DIR/last"
+	echo /root > "$SHELL_DIR/cwd"
+	echo "$1" > "$SHELL_DIR/chat"
+	tg_reply "$1" "console open (root, /root). /exit closes it."
+	is_admin "$1" || tg_reply "$TG_CHAT" "console opened by $name ($1)"
+	event "shell opened by $name ($1)"
+}
+
+HELP="/status, /log, /capture (last portal capture), /diag (diagnosis bundle), /update, /network, /mac, /primary (leave the rescue hotspot), /shell (console on the router), /exit
 admin: /invite, /users, /remove <id>, /reboot, /mac original, /mac reset"
 
 bot_handle() {
 	chat=$1
 	text=$2
-	name=$(echo "$3" | tr -cd '[:alnum:] ._-' | cut -c1-32)
+	name=$(echo "$3" | tr -cd 'A-Za-z0-9 ._-' | cut -c1-32)
 	cmd=${text%% *}
 	cmd=${cmd%@*}
 	arg=${text#"${text%% *}"}
@@ -139,7 +267,9 @@ bot_handle() {
 	/update)
 		state_set update_last "$(now)"
 		/usr/bin/gateway-update
-		tg_reply "$chat" "$(tail -n 1 "$STATE_DIR/log")"
+		# An installed update is announced as a message anyway; otherwise say what happened.
+		last=$(tail -n 1 "$STATE_DIR/log" | cut -c21-)
+		case "$last" in notify:*) ;; *) tg_reply "$chat" "$last" ;; esac
 		;;
 	/invite | /users | /remove | /reboot)
 		if ! is_admin "$chat"; then
@@ -176,13 +306,28 @@ bot_handle() {
 			;;
 		esac
 		;;
-	*) tg_reply "$chat" "unknown command. $HELP" ;;
+	/shell) shell_cmd "$chat" "$arg" ;;
+	/exit)
+		if shell_open_for "$chat"; then
+			shell_close "/exit"
+		else
+			tg_reply "$chat" "no console open"
+		fi
+		;;
+	*)
+		if shell_open_for "$chat"; then
+			shell_run "$chat" "$text"
+		else
+			tg_reply "$chat" "unknown command. $HELP"
+		fi
+		;;
 	esac
 }
 
 # Fetch and handle new messages. The offset is stored before each command runs.
 bot_poll() {
 	tg_ok || return 0
+	shell_check
 	offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
 	# $1: long polling, Telegram answers as soon as a message arrives or after $1 seconds.
 	TG_MAX_TIME=$(( ${1:-0} + 5 ))
