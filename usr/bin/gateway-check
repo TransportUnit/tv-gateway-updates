@@ -6,6 +6,47 @@
 . /usr/lib/gateway/lib.sh
 . /usr/lib/gateway/net.sh
 . /usr/lib/gateway/bot.sh
+. /usr/lib/gateway/diag.sh
+. /usr/lib/gateway/recovery.sh
+. /usr/lib/gateway/www.sh
+. /usr/lib/gateway/led.sh
+
+# "gateway-check bot" (cron, every minute): Telegram commands by long polling for BOT_LOOP seconds, so
+# answers come within seconds. One loop at a time; one whose last sign of life is 2 minutes old is
+# stale. If no loop runs (e.g. its cron line is missing), the normal run polls once a minute itself.
+# 45 s, not more: BusyBox crond skips a job whose previous run has not quite ended at the next minute
+# (seen with 55 s: a loop only every other minute).
+BOT_LOOP=${BOT_LOOP:-45}
+if [ "$1" = bot ]; then
+	[ "$BOT_LOOP" -gt 0 ] || exit 0
+	# The previous minute's loop may still be finishing: wait up to 10 s for its lock.
+	n=0
+	until mkdir "$STATE_DIR/botlock" 2>/dev/null; do
+		if [ "$(age bot_alive)" -ge 120 ]; then
+			log "bot: stale loop lock removed"
+			break
+		fi
+		n=$(( n + 1 ))
+		[ $n -le 10 ] || exit 0
+		sleep 1
+	done
+	trap 'rmdir "$STATE_DIR/botlock" 2>/dev/null' EXIT
+	end=$(( $(now) + BOT_LOOP ))
+	while :; do
+		state_set bot_alive "$(now)"
+		t=$(( end - $(now) ))
+		[ $t -ge 1 ] || break
+		[ $t -gt 25 ] && t=25
+		# A failed poll (offline) waits up to 5 s, never past the end of the loop; 1 s after any poll, so
+		# a server that answers at once (e.g. a portal instead of Telegram) is not asked nonstop.
+		s=1
+		bot_poll "$t" || s=5
+		t=$(( end - $(now) ))
+		[ $s -gt $t ] && s=$t
+		[ $s -gt 0 ] && sleep $s
+	done
+	exit 0
+fi
 
 # One run at a time; a lock older than 10 minutes is stale.
 LOCK="$STATE_DIR/lock"
@@ -15,6 +56,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 state_set lock_time "$(now)"
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+boot_check
 
 # set_status NEW [quiet]: a portal episode is quiet; it is reported when it ends or when login fails.
 set_status() {
@@ -23,10 +65,12 @@ set_status() {
 	since=$(state_get status_since "$(now)")
 	state_set status "$1"
 	state_set status_since "$(now)"
-	log "status $prev -> $1"
+	event "status $prev -> $1"
 	[ -n "$2" ] && return
 	if [ "$1" = online ]; then
-		if [ "$prev" = unknown ]; then
+		if rescue_active; then
+			notify "online, but only over the rescue hotspot $RESCUE_SSID (was $prev)"
+		elif [ "$prev" = unknown ]; then
 			notify "online"
 		else
 			notify "online again (was $prev for $(fmt_dur $(( $(now) - since ))))"
@@ -79,9 +123,22 @@ capture() {
 # Try the site recipe; back off 1, 2, 4 ... 30 minutes between failed attempts.
 login() {
 	[ "$(now)" -lt "$(state_get login_next 0)" ] && return
+	portal_fetch
+	# Redirected, but the portal page does not answer: the provider's portal server is down. That is
+	# no failed login and no sign of a block; look again in 2 minutes.
+	if [ ! -s "$PAGE" ]; then
+		state_set login_next $(( $(now) + 120 ))
+		if [ "$(state_get portal_state)" != unreachable ]; then
+			state_set portal_state unreachable
+			event "portal server not answering: $PAGE_URL"
+			notify "portal server not answering ($PAGE_URL), provider side; waiting"
+		fi
+		return
+	fi
+	[ "$(state_get portal_state)" = unreachable ] && state_set portal_state ""
 	attempt=$(( $(state_get login_attempts 0) + 1 ))
 	state_set login_attempts $attempt
-	portal_fetch
+	rm -f "$STATE_DIR/resp.html"
 	/etc/gateway/portal-login.sh "$PAGE" "$PAGE_URL" > "$STATE_DIR/login.out" 2>&1
 	rc=$?
 	info=$(tail -n 1 "$STATE_DIR/login.out")
@@ -94,6 +151,23 @@ login() {
 		# Fetch a newer recipe right after a login, the moment the router is reachable again.
 		state_set update_last 0
 		set_status online
+		return
+	fi
+	# A clear refusal (recipe rc 3, refusal text in the reply, or on a page without a form) is a state of
+	# its own: reported once, no automatic workaround, the login tried again every 30 minutes.
+	refusal=""
+	[ $rc -eq 3 ] && refusal=${info#*refused: }
+	[ -n "$refusal" ] || refusal=$(portal_refusal "$STATE_DIR/resp.html")
+	[ -n "$refusal" ] || [ $rc -ne 2 ] || refusal=$(portal_refusal "$PAGE")
+	if [ -n "$refusal" ]; then
+		state_set login_next $(( $(now) + 1800 ))
+		log "login attempt $attempt refused: $refusal"
+		if [ "$(state_get portal_state)" != denied ]; then
+			state_set portal_state denied
+			event "portal REFUSED: $refusal"
+			notify "portal REFUSED access: '$refusal'. No automatic workaround (no MAC change); login tried again every 30 min."
+			[ "$(state_get episode_captured 0)" = 1 ] || capture
+		fi
 		return
 	fi
 	delay=$(( 60 << (attempt - 1) ))
@@ -110,6 +184,21 @@ login() {
 
 probe
 [ "$PROBE" = online ] || { sleep 5; probe; }
+[ "$PROBE" = online ] && time_check
+
+# Which layer fails; a new failure class is stored as an event (once, not every minute).
+diag_run
+state_set diag_info "$DIAG_INFO"
+if [ "$DIAG" != "$(state_get diag)" ]; then
+	state_set diag "$DIAG"
+	case "$DIAG" in
+	online | portal) ;;
+	*)
+		event "diag $DIAG ($DIAG_INFO)"
+		diag_bundle >/dev/null
+		;;
+	esac
+fi
 
 case "$PROBE" in
 online)
@@ -145,7 +234,21 @@ offline)
 	;;
 esac
 
+# Recovery: at most one action per run while not online; an outage is closed and reported once online.
+if [ "$PROBE" != online ]; then
+	rec_step
+fi
+
 if [ "$PROBE" = online ]; then
+	if rescue_active; then
+		# Online only over the user's rescue hotspot: report and take commands, the outage stays open.
+		rescue_online
+	else
+		rm -f "$STATE_DIR/portal_state" "$STATE_DIR/rescue_since" "$STATE_DIR/rescue_reported"
+		rec_online
+		site_report
+		[ "$(kv_get "$REC_DIR/reboots" since_online 0)" = 0 ] || kv_set "$REC_DIR/reboots" since_online 0
+	fi
 	rm -f "$STATE_DIR/net_tried"
 	if [ "$(state_get net_announce 0)" = 1 ]; then
 		state_set net_announce 0
@@ -169,5 +272,11 @@ if [ "$PROBE" = online ]; then
 		/usr/bin/gateway-update
 		queue_flush || true
 	fi
-	bot_poll || log "telegram poll failed"
+	if [ "$BOT_LOOP" -eq 0 ] || [ "$(age bot_alive)" -ge 120 ]; then
+		bot_poll || log "telegram poll failed"
+	fi
 fi
+
+# The status page and the LED show this run.
+www_write
+led_update

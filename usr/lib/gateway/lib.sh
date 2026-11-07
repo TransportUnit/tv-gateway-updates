@@ -15,6 +15,13 @@ CAPTURE_DIR=${CAPTURE_DIR:-/root/gateway-captures}
 LIB_DIR=${LIB_DIR:-/usr/lib/gateway}
 USERS_FILE=${USERS_FILE:-/etc/gateway/users}
 HINT_FILE=${HINT_FILE:-/etc/gateway/login_hint}
+REC_DIR=${REC_DIR:-/etc/gateway/recovery}
+EVENTS=${EVENTS:-/etc/gateway/events}
+EVENTS_MAX=${EVENTS_MAX:-200}
+EVENTS_PER_HOUR=${EVENTS_PER_HOUR:-30}
+BOOT_ID_FILE=${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
+UPTIME_FILE=${UPTIME_FILE:-/proc/uptime}
+PORTAL_REFUSED_PATTERNS=${PORTAL_REFUSED_PATTERNS:-gesperrt|blockiert|verweigert|kontingent|nicht berechtigt|zu viele ger|blocked|denied|quota|limit reached|limit exceeded|not authori[sz]ed|too many devices}
 UA="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 
 mkdir -p "$STATE_DIR/queue"
@@ -35,6 +42,86 @@ state_set() { echo "$2" > "$STATE_DIR/$1"; }
 
 # Seconds since the timestamp stored under $1 (large if never set).
 age() { echo $(( $(now) - $(state_get "$1" 0) )); }
+
+# Seconds since boot. The router has no real-time clock, so deadlines that must survive a wrong clock
+# use uptime and the boot counter.
+uptime_s() { cut -d. -f1 "$UPTIME_FILE"; }
+
+# Persistent state on flash (survives reboot and power loss), written only on state changes.
+# kv_get FILE KEY [DEFAULT]; kv_set FILE KEY VALUE [KEY VALUE ...]: "key=value" lines, all pairs of
+# one call replaced in one atomic rename.
+kv_get() {
+	v=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1)
+	echo "${v:-$3}"
+}
+kv_set() {
+	f=$1
+	shift
+	mkdir -p "$(dirname "$f")"
+	cp "$f" "$f.tmp" 2>/dev/null || : > "$f.tmp"
+	while [ $# -ge 2 ]; do
+		grep -v "^$1=" "$f.tmp" > "$f.tmp2"
+		echo "$1=$2" >> "$f.tmp2"
+		mv "$f.tmp2" "$f.tmp"
+		shift 2
+	done
+	mv "$f.tmp" "$f" && sync
+}
+
+# Count each boot once (the kernel's boot_id changes on every boot). Sets BOOT, the current boot number.
+boot_check() {
+	if [ -f "$STATE_DIR/boot" ]; then
+		BOOT=$(cat "$STATE_DIR/boot")
+		return
+	fi
+	id=$(cat "$BOOT_ID_FILE" 2>/dev/null)
+	BOOT=$(kv_get "$REC_DIR/boots" count 0)
+	if [ "$(kv_get "$REC_DIR/boots" id)" != "$id" ]; then
+		BOOT=$(( BOOT + 1 ))
+		kv_set "$REC_DIR/boots" count "$BOOT" id "$id"
+		event "boot $BOOT"
+	fi
+	state_set boot "$BOOT"
+}
+
+# Event log on flash: a ring of EVENTS_MAX lines "seq|boot|uptime|time|text". At most EVENTS_PER_HOUR
+# are written per hour of uptime; more only go to the RAM log and are counted. The time is marked "~"
+# until the clock is known to be right ($STATE_DIR/time_ok).
+event() {
+	log "event: $*"
+	h=$(( $(uptime_s) / 3600 ))
+	if [ "$(state_get ev_hour -1)" != "$h" ]; then
+		dropped=$(state_get ev_dropped 0)
+		state_set ev_hour "$h"
+		state_set ev_count 0
+		state_set ev_dropped 0
+		[ "$dropped" -gt 0 ] && event_write "$dropped events not stored (limit $EVENTS_PER_HOUR per hour)"
+	fi
+	c=$(state_get ev_count 0)
+	if [ "$c" -ge "$EVENTS_PER_HOUR" ]; then
+		state_set ev_dropped $(( $(state_get ev_dropped 0) + 1 ))
+		return
+	fi
+	state_set ev_count $(( c + 1 ))
+	event_write "$*"
+}
+
+event_write() {
+	last=$(tail -n 1 "$EVENTS" 2>/dev/null | cut -d'|' -f1)
+	case "$last" in '' | *[!0-9]*) last=0 ;; esac
+	t=$(date '+%Y-%m-%d %H:%M')
+	[ -f "$STATE_DIR/time_ok" ] || t="~$t"
+	mkdir -p "$(dirname "$EVENTS")"
+	printf '%s|%s|%s|%s|%s\n' $(( last + 1 )) "${BOOT:-0}" "$(uptime_s)" "$t" \
+		"$(printf '%s' "$*" | tr '|\n' '/ ')" >> "$EVENTS"
+	if [ "$(grep -c '' "$EVENTS")" -gt "$EVENTS_MAX" ]; then
+		tail -n "$EVENTS_MAX" "$EVENTS" > "$EVENTS.tmp" && mv "$EVENTS.tmp" "$EVENTS"
+	fi
+	sync
+}
+
+# Events after sequence number $1, oldest first.
+events_since() { awk -F'|' -v s="${1:-0}" '$1 > s' "$EVENTS" 2>/dev/null; }
 
 next_seq() {
 	s=$(( $(state_get seq 0) + 1 ))
@@ -71,7 +158,7 @@ tg_send_item() {
 			--data-urlencode "chat_id=$1" --data-urlencode "text=$NAME: $(cat "$3")" ;;
 	*.doc-*)
 		curl -sf -m 60 -o /dev/null "$TG_API/bot$TG_TOKEN/sendDocument" \
-			-F "chat_id=$1" -F "caption=$NAME: ${2#*.doc-}" -F "document=@$3" ;;
+			-F "chat_id=$1" -F "caption=$NAME: ${2#*.doc-}" -F "document=@$3;filename=${2#*.doc-}" ;;
 	esac
 }
 
@@ -87,6 +174,28 @@ queue_flush() {
 		done
 		rm -f "$p"
 	done
+}
+
+# The clock is right if it matches the Date header of the last online probe (within 5 minutes). Until
+# then times in the event log are marked "~": the router has no real-time clock. Called right after an
+# online probe, before the status change is reported.
+time_check() {
+	[ -f "$STATE_DIR/time_ok" ] && return
+	d=$(sed -n 's/^[Dd]ate: *//p' "$STATE_DIR/probe.head" | tr -d '\r' | head -n 1)
+	t=$(date -u -D '%a, %d %b %Y %H:%M:%S' -d "${d% GMT}" +%s 2>/dev/null) || return
+	diff=$(( $(now) - t ))
+	[ "${diff#-}" -le 300 ] || return
+	touch "$STATE_DIR/time_ok"
+	# Until now the clock may have been days behind (last saved time at boot): a status change stamped
+	# before the boot moment would make durations far too long.
+	b=$(( $(now) - $(uptime_s) ))
+	[ "$(state_get status_since "$b")" -ge "$b" ] || state_set status_since "$b"
+}
+
+# Print a short excerpt if the HTML file $1 clearly refuses access (PORTAL_REFUSED_PATTERNS).
+portal_refusal() {
+	[ -s "$1" ] || return 1
+	sed 's/<[^>]*>/ /g' "$1" | tr -s ' \t\r\n' ' ' | grep -ioE ".{0,60}($PORTAL_REFUSED_PATTERNS).{0,60}" | head -n 1
 }
 
 # PROBE=online (204, empty body), portal (any other HTTP answer) or offline (no answer).
@@ -154,7 +263,8 @@ portal_send() {
 # fetched again before each further first-step attempt (a failed attempt may invalidate its token).
 # A reply with a different form (e.g. a confirmation page) is followed, up to 3 steps. The first-step
 # variant that worked is remembered and tried first next time.
-# Returns 0 when online, 1 when nothing worked, 2 when the page has no usable form (LOGIN_INFO says why).
+# Returns 0 when online, 1 when nothing worked, 2 when the page has no usable form, 3 when a reply
+# clearly refuses access (no further tries; LOGIN_INFO says why).
 portal_generic_login() {
 	page=$1
 	url=$2
@@ -187,6 +297,11 @@ portal_generic_login() {
 				[ "$first" = "$GATEWAY_HINT" ] || echo "$first" > "$HINT_FILE"
 				LOGIN_INFO="online with $first (step $step, $tries tries)"
 				return 0
+			fi
+			refused=$(portal_refusal "$RESP")
+			if [ -n "$refused" ]; then
+				LOGIN_INFO="refused: $refused"
+				return 3
 			fi
 			# A different form in the reply is the next step; the same form again means "rejected".
 			next=$(lua "$LIB_DIR/portal-generic.lua" candidates "$RESP" "$RESP_URL" 2>/dev/null | head -n 1)

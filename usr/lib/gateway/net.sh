@@ -21,9 +21,30 @@ net_scan() {
 net_current() {
 	if [ -n "$STA_SECTION" ]; then
 		uci -q get "$STA_SECTION.ssid"
-	else
-		iwinfo "$STA_IFACE" info 2>/dev/null | sed -n 's/.*ESSID: "\(.*\)"/\1/p'
+		return
 	fi
+	# GL's repeater status (read field by field: it contains the key), else iwinfo.
+	s=$(ubus call repeater status 2>/dev/null | jsonfilter -e @.ssid 2>/dev/null)
+	[ -n "$s" ] || s=$(iwinfo "$STA_IFACE" info 2>/dev/null | sed -n 's/.*ESSID: "\(.*\)"/\1/p')
+	echo "$s"
+}
+
+# Join a network through GL's repeater service (it owns the WiFi config): repeater_connect SSID [MAC].
+# The key, if the network is saved with one, comes from GL's config (or RESCUE_KEY); it is never logged.
+# The rescue hotspot is joined without saving it: GL joins saved networks by itself whenever it loses
+# the current one, and the rescue hotspot must only be used when our scripts decide so.
+repeater_connect() {
+	key=$(uci -q show repeater 2>/dev/null | awk -F "'" -v s="$1" '
+		/\.ssid=/ { split($0, a, "."); if ($2 == s) want = a[2] }
+		/\.key=/ { split($0, a, "."); keys[a[2]] = $2 }
+		END { if (want != "") print keys[want] }')
+	remember=true
+	[ "$1" = "$RESCUE_SSID" ] && key=$RESCUE_KEY && remember=false
+	json="{\"ssid\":\"$1\",\"remember\":$remember"
+	[ -n "$key" ] && json="$json,\"key\":\"$key\""
+	[ -n "$2" ] && json="$json,\"macaddr\":\"$2\""
+	key=""
+	ubus call repeater connect "$json}" >/dev/null 2>&1
 }
 
 # Allowed networks visible now, in order: primary, then open pattern matches by signal (strongest first).

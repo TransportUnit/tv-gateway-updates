@@ -10,7 +10,7 @@ CMD_MAX_AGE=${CMD_MAX_AGE:-300}
 tg_api() {
 	m=$1
 	shift
-	curl -sf -m 20 "$TG_API/bot$TG_TOKEN/$m" "$@"
+	curl -sf -m "${TG_MAX_TIME:-20}" "$TG_API/bot$TG_TOKEN/$m" "$@"
 }
 
 tg_reply() { tg_api sendMessage --data-urlencode "chat_id=$1" --data-urlencode "text=$2" -o /dev/null; }
@@ -48,6 +48,7 @@ invite_use() {
 status_text() {
 	since=$(date -d @"$(state_get status_since 0)" '+%d.%m. %H:%M' 2>/dev/null)
 	echo "status: $(state_get status unknown) since $since"
+	echo "diagnosis: $(state_get diag -)"
 	up=$(net_current 2>/dev/null)
 	echo "upstream: ${up:-unknown}"
 	leases=0
@@ -57,8 +58,8 @@ status_text() {
 	echo "uptime: $(uptime | sed 's/^ *//')"
 }
 
-HELP="/status, /log, /capture (last portal capture), /update, /network
-admin: /invite, /users, /remove <id>, /reboot"
+HELP="/status, /log, /capture (last portal capture), /diag (diagnosis bundle), /update, /network, /mac, /primary (leave the rescue hotspot)
+admin: /invite, /users, /remove <id>, /reboot, /mac original, /mac reset"
 
 bot_handle() {
 	chat=$1
@@ -91,6 +92,49 @@ bot_handle() {
 		else
 			tg_reply "$chat" "no capture yet"
 		fi
+		;;
+	/primary)
+		if rescue_active; then
+			tg_reply "going back to $UPSTREAM_SSID"
+			rescue_leave "/primary by $chat"
+		else
+			tg_reply "not on the rescue hotspot"
+		fi
+		;;
+	/diag)
+		f=$(diag_bundle now)
+		tg_api sendDocument -F "chat_id=$chat" -F "caption=$(basename "$f")" -F "document=@$f" -o /dev/null
+		;;
+	/mac)
+		if [ -z "$arg" ]; then
+			tg_reply "$chat" "$(/usr/bin/gateway-mac status 2>&1)"
+			return
+		fi
+		if ! is_admin "$chat"; then
+			tg_reply "$chat" "admin only"
+			return
+		fi
+		case "$arg" in
+		original | reset)
+			state_set mac_asked "$(now) $arg"
+			tg_reply "$chat" "send '/mac $arg yes' within 2 minutes"
+			;;
+		"original yes" | "reset yes")
+			a=${arg% yes}
+			if [ "$(state_get mac_asked | cut -d' ' -f2)" != "$a" ] ||
+				[ $(( $(now) - $(state_get mac_asked 0 | cut -d' ' -f1) )) -gt 120 ]; then
+				tg_reply "$chat" "send '/mac $a' first"
+				return
+			fi
+			state_set mac_asked 0
+			event "bot: /mac $a by $chat"
+			[ "$a" = original ] && tg_reply "$chat" "trying the original MAC; back to the alternative one if not online within $(( ${MAC_VERIFY:-1200} / 60 )) min"
+			out=$(/usr/bin/gateway-mac "$a" 2>&1)
+			event "$out"
+			[ "$a" = reset ] && tg_reply "$chat" "$out"
+			;;
+		*) tg_reply "$chat" "usage: /mac, /mac original, /mac reset" ;;
+		esac
 		;;
 	/update)
 		state_set update_last "$(now)"
@@ -140,7 +184,12 @@ bot_handle() {
 bot_poll() {
 	tg_ok || return 0
 	offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
-	json=$(tg_api getUpdates --data "offset=$offset" --data "timeout=0") || return 1
+	# $1: long polling, Telegram answers as soon as a message arrives or after $1 seconds.
+	TG_MAX_TIME=$(( ${1:-0} + 5 ))
+	json=$(tg_api getUpdates --data "offset=$offset" --data "timeout=${1:-0}")
+	rc=$?
+	TG_MAX_TIME=20
+	[ $rc -eq 0 ] || return 1
 	n=$(echo "$json" | jsonfilter -e '@.result[*].update_id' | wc -l)
 	i=0
 	while [ $i -lt "$n" ]; do
